@@ -258,10 +258,16 @@ class MultiModalRegistry:
         """
         if self.has_processor(model_config):
             processor = self.create_processor(model_config, disable_cache=True)
+            profiler = MultiModalProfiler(processor)
+
             seq_len = model_config.max_model_len
             mm_limits = self.get_mm_limits_per_prompt(model_config)
-            return processor.info.get_mm_max_tokens_per_item(
-                seq_len, mm_limits)
+
+            return profiler.get_mm_max_tokens(
+                seq_len,
+                {modality: 1
+                 for modality in mm_limits},
+            )
 
         return {
             key: plugin.get_max_multimodal_tokens(model_config)
@@ -458,6 +464,7 @@ class MultiModalRegistry:
         self,
         model_config: "ModelConfig",
         seq_len: int,
+        mm_counts: Optional[Mapping[str, int]] = None,
     ) -> DummyDecoderData:
         """
         Create dummy data for profiling the memory usage of a model.
@@ -466,7 +473,7 @@ class MultiModalRegistry:
         """
         processor = self.create_processor(model_config, disable_cache=True)
         profiler = MultiModalProfiler(processor)
-        dummy_data = profiler.get_decoder_dummy_data(seq_len)
+        dummy_data = profiler.get_decoder_dummy_data(seq_len, mm_counts)
 
         # Having more tokens is over-conservative but otherwise fine
         token_ids = dummy_data.prompt_token_ids
@@ -481,6 +488,7 @@ class MultiModalRegistry:
         self,
         model_config: "ModelConfig",
         seq_len: int,
+        mm_counts: Optional[Mapping[str, int]] = None,
     ) -> DummyEncoderData:
         """
         Create dummy data for profiling the memory usage of a model.
@@ -489,7 +497,7 @@ class MultiModalRegistry:
         """
         processor = self.create_processor(model_config, disable_cache=True)
         profiler = MultiModalProfiler(processor)
-        dummy_data = profiler.get_encoder_dummy_data(seq_len)
+        dummy_data = profiler.get_encoder_dummy_data(seq_len, mm_counts)
 
         # Having more tokens is over-conservative but otherwise fine
         token_ids = dummy_data.prompt_token_ids
