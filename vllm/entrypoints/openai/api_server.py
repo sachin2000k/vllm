@@ -69,7 +69,10 @@ from vllm.entrypoints.openai.protocol import (ChatCompletionRequest,
                                               TranscriptionResponse,
                                               UnloadLoRAAdapterRequest)
 # yapf: enable
+from vllm.entrypoints.openai.protocol_classify import (ClassifyRequest,
+                                                      ClassifyResponse)
 from vllm.entrypoints.openai.serving_chat import OpenAIServingChat
+from vllm.entrypoints.openai.serving_classify import OpenAIServingClassify
 from vllm.entrypoints.openai.serving_completion import OpenAIServingCompletion
 from vllm.entrypoints.openai.serving_embedding import OpenAIServingEmbedding
 from vllm.entrypoints.openai.serving_engine import OpenAIServing
@@ -364,6 +367,10 @@ def pooling(request: Request) -> Optional[OpenAIServingPooling]:
     return request.app.state.openai_serving_pooling
 
 
+def classify(request: Request) -> Optional[OpenAIServingClassify]:
+    return request.app.state.openai_serving_classify
+
+
 def embedding(request: Request) -> Optional[OpenAIServingEmbedding]:
     return request.app.state.openai_serving_embedding
 
@@ -551,6 +558,25 @@ async def create_embedding(request: EmbeddingRequest, raw_request: Request):
 
     assert_never(generator)
 
+
+@router.post("/v1/classify", dependencies=[Depends(validate_json_request)])
+@with_cancellation
+@load_aware_call
+async def create_classify(
+    request: ClassifyRequest,
+    raw_request: Request,
+) -> Union[ClassifyResponse, ErrorResponse]:
+    """Create classification head logits."""
+    serving_classify_instance = classify(raw_request)
+    if serving_classify_instance is None:
+        return base(raw_request).create_error_response(
+            "Classification not supported for this model")
+    try:
+        return await serving_classify_instance.create_classify(
+            request, raw_request)
+    except Exception as e:
+        logger.exception("Error in create_classify")
+        return base(raw_request).create_error_response(str(e))
 
 @router.post("/pooling", dependencies=[Depends(validate_json_request)])
 @with_cancellation
@@ -1021,6 +1047,32 @@ async def init_app_state(
         request_logger=request_logger,
     ) if model_config.runner_type == "transcription" else None
     state.task = model_config.task
+
+    # Create serving classify
+    openai_serving_classify = None
+    openai_serving_pooling = None
+    if model_config.task == "classify":
+        logger.info("Task type is classify")
+        # Create serving classify
+        openai_serving_pooling = OpenAIServingPooling(
+            engine_client=engine_client,
+            model_config=model_config,
+            models=state.openai_serving_models,
+            request_logger=request_logger,
+            chat_template=None,
+            chat_template_content_format=args.chat_template_content_format,
+        )
+        openai_serving_classify = OpenAIServingClassify(
+            engine_client=engine_client,
+            model_config=model_config,
+            models=state.openai_serving_models,
+            request_logger=request_logger,
+            chat_template=None,
+            chat_template_content_format=args.chat_template_content_format,
+        )
+    
+    state.openai_serving_classify = openai_serving_classify
+
 
     state.enable_server_load_tracking = args.enable_server_load_tracking
     state.server_load_metrics = 0
