@@ -60,8 +60,67 @@ def get_lora_id():
 import torch
 from vllm.model_executor.models.adapters import as_classification_model
 
+def _replace_classification_head(base_model, num_labels, hidden_size, device, dtype=None):
+    """
+    Completely replace the classification head with a new one.
+    
+    Args:
+        base_model: The model to attach the classification head to
+        num_labels: Number of output labels for the classification head
+        hidden_size: Hidden dimension size for the classification head
+        device: Device to place the new classification head on
+        dtype: Data type for the classification head (defaults to model's dtype)
+    
+    Returns:
+        The newly created classification head
+    """
+    # Get model's default dtype if not specified
+    if dtype is None:
+        dtype = next(base_model.parameters()).dtype
+    
+    logger.info(f"Creating new classification head with {num_labels} labels, "
+                f"hidden_size={hidden_size}, device={device}, dtype={dtype}")
+    
+    # Import here to avoid circular imports
+    from vllm.model_executor.layers.linear import RowParallelLinear
+    
+    # Create new classification head
+    new_head = RowParallelLinear(
+        hidden_size, 
+        num_labels, 
+        bias=True, 
+        prefix=""
+    ).to(device=device, dtype=dtype)
+    
+    # Initialize weights properly
+    with torch.no_grad():
+        # Use appropriate initialization based on model type
+        torch.nn.init.normal_(new_head.weight, mean=0.0, std=0.02)
+        if hasattr(new_head, 'bias') and new_head.bias is not None:
+            torch.nn.init.zeros_(new_head.bias)
+    
+    # Replace the head
+    base_model.score = new_head
+    
+    # Update config if available
+    if hasattr(base_model, "config"):
+        base_model.config.num_labels = num_labels
+        
+    return new_head
+
+
 def _attach_classification_head(base_model, tensors: dict):
-    """Attach a classification head to base_model using weights from tensors (if presenr)."""
+    """
+    Attach a classification head to base_model using weights from tensors.
+    
+    This improved implementation ensures proper cache clearing and complete
+    replacement of classification heads when switching between adapters.
+    
+    Args:
+        base_model: The model to attach the classification head to
+        tensors: Dictionary of tensor weights from the adapter
+    """
+    
     # Find classification weight and bias in tensors
     weight_key = None
     bias_key = None
@@ -70,40 +129,68 @@ def _attach_classification_head(base_model, tensors: dict):
             weight_key = key
         if key.endswith("score.bias") or key.endswith("classifier.bias"):
             bias_key = key
+    
     if weight_key is None:
-        return # No classification head in theis adapter
+        logger.info("No classification head found in adapter tensors")
+        return  # No classification head in this adapter
 
     # Infer number of labels from weight shape
     num_labels = tensors[weight_key].shape[0]
     hidden_size = tensors[weight_key].shape[1]
 
-    # Get device from the base model
+    # Get device and dtype from the base model
     device = next(base_model.parameters()).device
-    logger.info(f"Base model device : {device}")
-    # If the model dosen't already have a 'score' attribute, convert it to a classification model
+    dtype = next(base_model.parameters()).dtype
+    
+    logger.info(f"Found classification head with {num_labels} labels in adapter")
+    logger.info(f"Base model device: {device}, dtype: {dtype}")
+    
+    # Store original class for potential restoration
+    original_class = base_model.__class__
+    
+    # If the model doesn't already have a 'score' attribute, convert it to a classification model
     if not hasattr(base_model, "score"):
-        # Transform the model class to a classification variant (adds self.score linear layer)
-        logger.info(f"Transforming to classification model: {base_model.__class__}")
-        base_model.__class__ = as_classification_model(base_model.__class__)
-        #update the config's num_labels for accuracy
-        if hasattr(base_model, "config"):
-            base_model.config.num_labels = num_labels
+        # Transform the model class to a classification variant
+        logger.info(f"Transforming to classification model: {original_class}")
+        from vllm.model_executor.models.adapters import as_classification_model
+        base_model.__class__ = as_classification_model(original_class)
+        
+        # Create new classification head
+        _replace_classification_head(base_model, num_labels, hidden_size, device, dtype)
     else:
-        # If the core layer exists, check if shape matches; if not, recreate it
-        current_out_features = base_model.score.weight.shape[0]
-        current_in_feature = base_model.score.weight.shape[1]
-        if current_out_features != num_labels or current_in_feature != hidden_size:
-            #replace with a new linear layer of correct shape
-            logger.info(f"Replacing the existing shape of {current_out_features}, {current_in_feature} with {num_labels, hidden_size}")
-            from vllm.model_executor.layers.linear import RowParallelLinear
-            base_model.score = RowParallelLinear(hidden_size, num_labels, bias=True, prefix="").to(device, dtype=torch.bfloat16)
+        # Always replace the classification head completely when switching adapters
+        logger.info(f"Replacing existing classification head")
+        _replace_classification_head(base_model, num_labels, hidden_size, device, dtype)
 
     # Load weights into the score layer
     with torch.no_grad():
-        base_model.score.weight.copy_(tensors[weight_key].to(device))
+        # Convert tensors to the right device and dtype
+        weight_tensor = tensors[weight_key].to(device=device, dtype=dtype)
+        
+        # Verify shapes match before copying
+        if weight_tensor.shape != base_model.score.weight.shape:
+            raise ValueError(
+                f"Classification weight shape mismatch: adapter has {weight_tensor.shape}, "
+                f"but model has {base_model.score.weight.shape}"
+            )
+        
+        # Copy weights
+        base_model.score.weight.copy_(weight_tensor)
+        
+        # Handle bias if present
         if bias_key:
-            base_model.score.score.bias.copy_(tensors[bias_key].to(device))
-    logger.info(f"[vLLM] Attached classification head with {num_labels} labels to the model.")
+            bias_tensor = tensors[bias_key].to(device=device, dtype=dtype)
+            if hasattr(base_model.score, 'bias') and base_model.score.bias is not None:
+                if bias_tensor.shape != base_model.score.bias.shape:
+                    raise ValueError(
+                        f"Classification bias shape mismatch: adapter has {bias_tensor.shape}, "
+                        f"but model has {base_model.score.bias.shape}"
+                    )
+                base_model.score.bias.copy_(bias_tensor)
+            else:
+                logger.warning(f"Bias key {bias_key} found in adapter but model has no bias")
+    
+    logger.info(f"Successfully attached classification head with {num_labels} labels to the model")
 
 class LoRAModel(AdapterModel):
     """A LoRA fine-tuned model."""

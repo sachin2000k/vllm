@@ -172,7 +172,7 @@ def as_classification_model(cls: _T) -> _T:
         cls,
         default_pooling_type=PoolingType.LAST,
         default_normalize=False,
-        default_softmax=True,
+        default_softmax=False,
     )
 
     class ModelForClassification(ModelForPooling):
